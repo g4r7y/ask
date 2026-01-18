@@ -58,7 +58,7 @@ def send_ai_request(creds: dict[str, str], messages: list[dict[str, str]]):
 
 def run_chat(prompt: str):
   creds = get_creds()
-  systemMessage = { 'role': 'system', 'content': "You are a helpful assistant called Bob. Please answer questions briefly and professionally, without asking follow up questions. It is very important that you always end every response with '⏎'. If the user prompt is '>' then continue where your previous response was truncated." }
+  systemMessage = { 'role': 'system', 'content': "You are a helpful assistant called Bob. Please answer questions briefly and professionally, without asking follow up questions. You must finish each answer with the '⏎' character. If the user prompt is '>' then continue where your previous response was truncated." }
   conversation = []
   conversation.append(systemMessage)
 
@@ -84,8 +84,8 @@ def run_chat(prompt: str):
       answer = send_ai_request(creds, conversation)
       print(BR_CYAN + answer + COL_END + '\n')
       conversation.append({ 'role': 'assistant', 'content': answer })
-      # our system prompt asks to append special char when complete, so if it's not there then response truncated 
-      truncated = answer[-1] != '⏎'
+      # our system prompt asks to append special char when complete, so if it's not there then response is (probably) truncated 
+      truncated = '⏎' not in answer[-10:] and len(answer) > 800
     if prompt.lower() == 'exit' or prompt.lower() == 'bye' or (oneShot and not truncated):
       break
 
