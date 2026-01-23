@@ -1,4 +1,4 @@
-# Ask: a simple command line AI chatbot
+# Ask: simple command line AI chatbot
 
 ## Overview
 
@@ -9,14 +9,23 @@ This script provides a command line LLM chatbot using CloudFlare Workers AI API.
 * Python 3.x
 * CloudFlare account with Workers AI API enabled
 
-## Usage
+## Setup
 
 The following environment variables need to be set:
 
 * `CLOUDFLARE_ACCOUNT`: Your CloudFlare account ID
 * `CLOUDFLARE_API_TOKEN`: Your CloudFlare Workers AI API token
 
-Usage:
+Install required python libs. e.g. using venv:
+
+```bash
+python3 -m venv ./myenv
+source ./myenv/bin/activate
+pip install -r requirements.txt
+```
+
+## Usage
+
 ```bash
 ./ask.py [prompt]
 ```

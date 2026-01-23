@@ -5,7 +5,8 @@ import sys
 import requests
 import json
 import argparse
-import readline
+from prompt_toolkit import PromptSession, ANSI
+import mdv
 
 GREEN   = '\033[92m'
 YELLOW  = '\033[33m'
@@ -58,7 +59,7 @@ def send_ai_request(creds: dict[str, str], messages: list[dict[str, str]]):
 
 def run_chat(prompt: str):
   creds = get_creds()
-  systemMessage = { 'role': 'system', 'content': "You are a helpful assistant called Bob. Please answer questions briefly and professionally, without asking follow up questions. You must finish each answer with the '⏎' character. If the user prompt is '>' then continue where your previous response was truncated." }
+  systemMessage = { 'role': 'system', 'content': "You are a helpful assistant called Bob. Please answer questions briefly and professionally, without asking follow up questions. Format all responses using markdown. You must finish each answer with the '⏎' character. If the user prompt is '>' then continue where your previous response was truncated." }
   conversation = []
   conversation.append(systemMessage)
 
@@ -71,21 +72,31 @@ def run_chat(prompt: str):
       # ask for next part of truncated response
       prompt = '>'
     elif not oneShot:
-      # get new prompt from user
-      readline.parse_and_bind("tab: complete")
-      prompt = input(GREEN + 'Ask: ' + YELLOW)
+      session = PromptSession(
+        ANSI(f"{GREEN}Ask: "), 
+        multiline=False # enable to allow CR in input
+      )
+      prompt = session.prompt()
+      concattedAnswer = ''
+
       
     if (prompt.lower() == 'clear'):
       conversation = []
       conversation.append(systemMessage)
       print(BR_CYAN + 'Conversation cleared.' + COL_END + '\n')
+
     else:
       conversation.append({ 'role': 'user', 'content': prompt })
       answer = send_ai_request(creds, conversation)
-      print(BR_CYAN + answer + COL_END + '\n')
       conversation.append({ 'role': 'assistant', 'content': answer })
+
       # our system prompt asks to append special char when complete, so if it's not there then response is (probably) truncated 
       truncated = '⏎' not in answer[-10:] and len(answer) > 800
+
+      # convert markdown to ANSI
+      ansiText = mdv.main(answer, theme='963.4449') #theme='757.2295'
+      print(ansiText)
+
     if prompt.lower() == 'exit' or prompt.lower() == 'bye' or (oneShot and not truncated):
       break
 
