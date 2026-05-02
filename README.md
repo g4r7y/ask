@@ -2,7 +2,7 @@
 
 ## Overview
 
-This script provides a command line LLM chatbot using CloudFlare Workers AI API.
+This script provides a command line LLM chatbot using CloudFlare Workers AI.
 
 ## Requirements
 
@@ -27,38 +27,52 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-./ask.py [prompt]
+./ask.py --help
 ```
 
-If no arguments are provided, the script enters conversation mode.
-
-Or, you can provide your LLM prompt as command line arguments, in which case the script will answer the prompt and exit. For example:
+### Conversation mode
 
 ```bash
-./ask.py How many legs does a centipede have?
+./ask.py
 ```
 
-You can also pipe in a prompt from another command. For example:
-
-```bash
-echo "Why is the sky blue?" | ./ask.py
-```
-
-And you can combine command line arguments with file redirected to stdin:
-
-```bash
-./ask.py Please can you review this file < bad-code.js
-```
-
-## Conversation Mode
-
-In conversation mode, the script will continuously prompt the user for input, building up the conversation context.
+By default, conversation mode is used. In conversation mode, it will continuously prompt the user for input, building up the conversation context.
 
 You can use the following commands:
 * `clear`: Clears the conversation history and starts a new conversation.
 * `exit` : Exits the script.
 
-## Models
+### Quick mode
 
-You can change the model in the script to other models supported by [Workers AI](https://developers.cloudflare.com/workers-ai/models/). OpenAI models are not currently supported as they use a different request format.
+```bash
+./ask.py -q
+```
+If -q is given, then quick mode is used, where it prompts the LLM once then exits.
 
+### Prompt text
+
+You can provide your prompt text as a command line argument. For example:
+
+```bash
+./ask.py -q Tell me a joke
+```
+
+You can also pipe in a prompt from another command. For example:
+
+```bash
+echo "Why is the sky blue?" | ./ask.py -q
+```
+
+And you can combine command line arguments with file redirected to stdin:
+
+```bash
+./ask.py Please can you review this code < stuff.js
+```
+
+### Models
+
+```bash
+./ask.py --model=openai
+```
+
+You can specify which model to use. Use the --help option to see the available models. These are a subset of the models supported by [Workers AI](https://developers.cloudflare.com/workers-ai/models/).
