@@ -14,14 +14,15 @@ BR_CYAN = '\033[96m'
 RED     = '\033[31m'
 COL_END = '\033[0m'
 
-CF_MODELS = {
-  'gemma'       : '@cf/google/gemma-4-26b-a4b-it',
-  'llama-small' : '@cf/meta/llama-3.2-3b-instruct',
-  'llama'       : '@cf/meta/llama-4-scout-17b-16e-instruct',
-  'nvidia-large': '@cf/nvidia/nemotron-3-120b-a12b',
-  'openai'      : '@cf/openai/gpt-oss-20b',
-  'openai-large': '@cf/openai/gpt-oss-120b'
+MODELS = {
+  'gemma'         : { 'name': '@cf/google/gemma-4-26b-a4b-it', 'schema': 'openai' },
+  'gpt'           : { 'name': '@cf/gpt/gpt-oss-20b', 'schema': 'openai' },
+  'gpt-large'     : { 'name': '@cf/gpt/gpt-oss-120b', 'schema': 'openai' },
+  'nemotron-large': { 'name': '@cf/nvidia/nemotron-3-120b-a12b', 'schema': 'openai' },
+  'llama-small'   : { 'name': '@cf/meta/llama-3.2-3b-instruct', 'schema': 'simple' },
+  'llama'         : { 'name': '@cf/meta/llama-4-scout-17b-16e-instruct', 'schema': 'simple' },
 }
+
 
 def get_creds() -> dict[str,str]:
   cloudFlareAccount = os.environ.get('CLOUDFLARE_ACCOUNT')
@@ -43,12 +44,12 @@ def prompt_llm(creds: dict[str, str], model: str, messages: list[dict[str, str]]
     'messages': messages
   }
 
-  if not model.startswith('llama'):
+  if MODELS[model]['schema'] == 'openai':
     payload['max_tokens'] = 512 + 200 * token_multiplier
 
   # /ai/run endpoint is the dynamic request format endpoint, supported for all models
   urlTemplate = 'https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{cf_model}'
-  url = urlTemplate.format(account=creds['account'], cf_model=CF_MODELS.get(model))
+  url = urlTemplate.format(account=creds['account'], cf_model=MODELS[model]['name'])
   hdrs = {'Authorization': 'Bearer '+ creds['token']}
 
   try:
@@ -71,7 +72,7 @@ def parse_result(model: str, result):
   truncated = False
   reasoning = ''
 
-  if not model.startswith('llama'): # openai, nvidia etc
+  if MODELS[model]['schema'] == 'openai':
     choice = result.get('choices', [None])[0]
     answer = choice.get('message',{}).get('content')
     reasoning = choice.get('message',{}).get('reasoning_content')
@@ -91,7 +92,8 @@ def parse_result(model: str, result):
   return answer, reasoning, truncated
 
 def get_summary(creds: dict[str, str], messages: list[dict[str, str]]):
-  system_message = { 'role': 'system', 'content': 'You are a useful chat bot' }
+  # summarise the conversation history, using a smaller model
+  system_message = { 'role': 'system', 'content': 'You are a concise chat bot' }
   user_message = { 'role': 'user', 'content': 'Condense the conversation history into a brief summary (100 words or less) that captures the essential information and context, focussing mainly on details provided by the user' }
   messages = [system_message] + messages + [user_message]
   answer, _, _ = prompt_llm(creds, 'llama-small', messages, 1)
@@ -105,7 +107,7 @@ def run_chat(prompt: str, model: str, one_shot: bool):
   conversation.append(system_message)
 
   # Long responses will be truncated, so when we detect truncation we do a continuation prompt.
-  # System prompt asks for a stop character so we can detect truncation, or for OpenAI we check for it reaching max_tokens.
+  # System prompt asks for a stop character so we can detect truncation, or for OpenAI etc. we check for it reaching max_tokens.
   # Either way, we limit the number of continuation requests in case the model fails to stop.
   truncated = False
   truncation_count = 0
@@ -123,6 +125,7 @@ def run_chat(prompt: str, model: str, one_shot: bool):
       if (prompt.lower() == 'clear'):
         conversation = []
         conversation.append(system_message)
+        prompt = ''
         print(BR_CYAN + 'Conversation cleared.' + COL_END + '\n')
         continue
 
@@ -155,20 +158,17 @@ def run_chat(prompt: str, model: str, one_shot: bool):
       truncation_count = 0
       prompt = ''
 
-
     # to keep tokens down, summarise oldest messages in the conversation with a summary of those messages
     if len(conversation) > 20:
-      print(f"{CYAN}Summarising:\nBEFORE:\nconversation length {len(conversation)}\n")
       summary = get_summary(creds, conversation[1:11])   # ignoring initial system prompt, summarise oldest 10 messages (i.e. 5 exchanges)
       summary_message = { 'role': 'assistant', 'content': summary }
       conversation = [system_message] + [summary_message] + conversation[11:]
-      print(f"AFTER:\nconversation length {len(conversation)}\n{conversation}{COL_END}\n")
 
 
 try:
   parser = argparse.ArgumentParser(description='Ask: your personal command line chatbot')
   parser.add_argument('text', type=str, nargs='*', default=[], help='initial question to ask')
-  parser.add_argument('--model', type=str, default='llama', choices=list(CF_MODELS.keys()),  help='choose which LLM to use. Defaults to medium-sized llama model.')
+  parser.add_argument('--model', type=str, default='llama', choices=list(MODELS.keys()),  help='choose which LLM to use. Defaults to llama 4 17b model.')
   parser.add_argument('-q', action='store_true', help='quick mode. Ask a single question then exit. If not set then defaults to conversation mode.')
   args = parser.parse_args()
   # take any command line text
