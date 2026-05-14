@@ -72,7 +72,22 @@ And you can combine command line arguments with file redirected to stdin:
 ### Models
 
 ```bash
-./ask.py --model=openai
+./ask.py --model=gpt
 ```
 
 You can specify which model to use. Use the --help option to see the available models. These are a subset of the models supported by [Workers AI](https://developers.cloudflare.com/workers-ai/models/).
+
+### Image to text mode
+
+Use the -i option for image-to-text inference. In this mode, the llava model is used.
+
+```bash
+./ask.py -i cat.png 
+```
+
+You can provide your own prompt for a more specific description:
+
+```bash
+./ask.py -i vinyl.jpg Please extract the artist, title and record label
+```
+
