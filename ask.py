@@ -5,7 +5,12 @@ import sys
 import requests
 import json
 import argparse
+import asyncio
+from contextlib import asynccontextmanager
 from prompt_toolkit import PromptSession, ANSI
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+from mcp.client.stdio import stdio_client, StdioServerParameters
 import mdv
 
 GREEN   = '\033[92m'
@@ -13,6 +18,68 @@ CYAN    = '\033[36m'
 BR_CYAN = '\033[96m'
 RED     = '\033[31m'
 COL_END = '\033[0m'
+
+# MCP server config. Hardcoded for now.
+# 'transport' is either 'http' or 'stdio':
+#   http:  { 'transport': 'http', 'url': 'http://localhost:8000/mcp' }
+#   stdio: { 'transport': 'stdio', 'command': 'npx', 'args': ['-y', '@modelcontextprotocol/server-filesystem', '/path/to/allowed/directory'] }
+MCP_SERVER_CONFIG = {
+  'transport': 'stdio',
+  'command': 'npx',
+  'args': ['-y', '@modelcontextprotocol/server-filesystem', '/mnt/data/workspace/sandbox']
+}
+
+
+# tools fetched from the MCP server at startup (list of mcp.types.Tool)
+mcp_tools = []
+
+
+@asynccontextmanager
+async def _mcp_session(config: dict):
+  # open a connection to the MCP server (using whichever transport is
+  # configured) and yield an initialized session.
+  transport = config.get('transport', 'http')
+
+  if transport == 'stdio':
+    params = StdioServerParameters(command=config['command'], args=config.get('args', []), env=config.get('env'), cwd=config.get('cwd'))
+    with open(os.devnull, 'w') as devnull:
+      async with stdio_client(params, errlog=devnull) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+          await session.initialize()
+          yield session
+
+  elif transport == 'http':
+    async with streamable_http_client(config['url']) as (read_stream, write_stream, _):
+      async with ClientSession(read_stream, write_stream) as session:
+        await session.initialize()
+        yield session
+
+  else:
+    raise ValueError(f"Unknown MCP transport '{transport}'")
+
+async def _fetch_mcp_tools(config: dict) -> list:
+  async with _mcp_session(config) as session:
+    result = await session.list_tools()
+    return result.tools
+
+async def _call_mcp_tool(config: dict, tool_function: str, tool_args: dict) -> dict:
+  async with _mcp_session(config) as session:
+    result = await session.call_tool(tool_function, tool_args)
+    if result.structured_content is not None:
+      return result.structured_content
+    # if no structured content fall back to concatenating any text content blocks
+    text = ''.join(block.text for block in result.content if block.type == 'text')
+    return { 'result': text }
+
+def connect_mcp_server(config: dict = MCP_SERVER_CONFIG):
+  # connect to the MCP server, fetch its tool list, then disconnect
+  global mcp_tools
+  try:
+    mcp_tools = asyncio.run(_fetch_mcp_tools(config))
+  except Exception as err:
+    print(RED + f'Failed to connect to MCP server ({config.get("transport")}): {err}' + COL_END)
+    mcp_tools = []
+
 
 MODELS = {
   'gemma'         : { 'name': '@cf/google/gemma-4-26b-a4b-it', 'schema': 'openai' },
@@ -39,6 +106,31 @@ def get_creds() -> dict[str,str]:
   creds = { 'account': cloudFlareAccount, 'token': apiToken }
   return creds
 
+def get_tools() -> list[dict]:
+  # append any tools discovered from the connected MCP server, converted to
+  # the OpenAI-compatible function-calling schema.
+  tools = []
+  for tool in mcp_tools:
+    tools.append({
+      'type': 'function',
+      'function': {
+        'name': tool.name,
+        'description': tool.description or '',
+        'parameters': tool.input_schema
+      }
+    })
+  return tools
+
+
+def run_tool(tool_function, tool_args) -> dict:
+  # call the tool on the connected MCP server and return its result.
+  try:
+    return asyncio.run(_call_mcp_tool(MCP_SERVER_CONFIG, tool_function, tool_args))
+  except Exception as err:
+    print(RED + f'Failed to call MCP tool {tool_function}: {err}' + COL_END)
+    return { 'error': str(err) }
+
+
 def post_llm_request(creds: dict[str, str], model: str, payload: dict[str, str]):
   # /ai/run endpoint is the dynamic request format endpoint, supported for all models
   urlTemplate = 'https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{cf_model}'
@@ -64,6 +156,11 @@ def prompt_llm(creds: dict[str, str], model: str, messages: list[dict[str, str]]
   payload = { 
     'messages': messages
   }
+
+  # assuming all our 'openai' type models support tool calling
+  if MODELS[model]['schema'] == 'openai':
+    payload['tools'] = get_tools()
+
   if MODELS[model]['schema'] == 'openai':
     payload['max_tokens'] = 512 + 200 * token_multiplier
 
@@ -76,34 +173,38 @@ def prompt_llm(creds: dict[str, str], model: str, messages: list[dict[str, str]]
 def parse_result(model: str, result):
   truncated = False
   reasoning = ''
+  tool_calls = []
 
   if MODELS[model]['schema'] == 'openai':
     choice = result.get('choices', [None])[0]
     answer = choice.get('message',{}).get('content')
     reasoning = choice.get('message',{}).get('reasoning_content')
+    tool_calls = choice.get('message',{}).get('tool_calls')
     if (choice.get('finish_reason') == 'length'):
       truncated = True
       if answer is None:
         answer = ''
+
   elif MODELS[model]['schema'] == 'llama':
     answer = result.get('response')
     # our system prompt asks to append special stop char, so if it's not there then response is (probably) truncated
     truncated = '⏎' not in answer[-10:] and len(answer) > 800
+
   elif MODELS[model]['schema'] == 'image_description':
     answer = result.get('description')
 
-  if answer is None:
+  if answer is None and tool_calls is []:
     print(f'Failed to parse {model} response:', result)
     answer = ''
 
-  return answer, reasoning, truncated
+  return answer, reasoning, truncated, tool_calls
 
 def get_summary(creds: dict[str, str], messages: list[dict[str, str]]):
   # summarise the conversation history, using a smaller model
   system_message = { 'role': 'system', 'content': 'You are a concise chat bot' }
   user_message = { 'role': 'user', 'content': 'Condense the conversation history into a brief summary (100 words or less) that captures the essential information and context, focussing mainly on details provided by the user' }
   messages = [system_message] + messages + [user_message]
-  answer, _, _ = prompt_llm(creds, 'llama-small', messages, 1)
+  answer, _, _, _ = prompt_llm(creds, 'llama-small', messages, 1)
   return answer
 
 def print_markdown(text: str):
@@ -126,28 +227,61 @@ def chat(prompt: str, model: str, one_shot: bool):
   truncation_count = 0
   TRUNCATION_LIMIT = 5
 
+  # tracks the conversation message index where tool_calls started, so tool calls can be pruned afterwards
+  tool_call_start = None
+
+  if len(prompt):
+    conversation.append({ 'role': 'user', 'content': prompt })
+    ask_prompt = False
+  else:
+    ask_prompt = True
+
+
   while True:
-    if len(prompt)==0:
+    if ask_prompt:
       # get user prompt 
       session = PromptSession(
         ANSI(f"{GREEN}Ask: "), 
         multiline=False # use True to allow CR in input
       )
       prompt = session.prompt()
-      
       if (prompt.lower() == 'clear'):
         conversation = []
         conversation.append(system_message)
-        prompt = ''
         print(BR_CYAN + 'Conversation cleared.' + COL_END + '\n')
+        ask_prompt = True
         continue
+      conversation.append({ 'role': 'user', 'content': prompt })
 
-    conversation.append({ 'role': 'user', 'content': prompt })
     token_multiplier = truncation_count if truncated else 1
-    answer, reasoning, truncated = prompt_llm(creds, model, conversation, token_multiplier)
-    truncated = truncated and truncation_count < TRUNCATION_LIMIT
+    answer, reasoning, truncated, tool_calls = prompt_llm(creds, model, conversation, token_multiplier)
+    
+    if tool_calls:
+      if tool_call_start is None:
+        tool_call_start = len(conversation)
+      conversation.append({ 'role': 'assistant', 'content': '', 'tool_calls': tool_calls })
+      for tc in tool_calls:
+        fn = tc['function']['name']
+        args = json.loads(tc['function']['arguments'])
+        print(BR_CYAN + 'Calling tool: ' + fn + COL_END + '\n')
+        tool_result = run_tool(fn, args) 
+        print(BR_CYAN + 'Tool results: ' + json.dumps(tool_result) + COL_END + '\n')
 
+        conversation.append({ 'role': 'tool', 'tool_call_id': tc['id'], 'content': json.dumps(tool_result) })
+      ask_prompt = False
+      continue
+    
+    # if we were making tool_calls, then at this point the tool calling is over and answer should contain the final result 
+    if tool_call_start is not None:
+      # we can now prune the tool_calls and tool results to save tokens.
+      conversation = conversation[:tool_call_start]
+      tool_call_start = None
+    
+    if answer is None:
+      answer = ''
     print_markdown(answer)
+
+    truncated = truncated and truncation_count < TRUNCATION_LIMIT
 
     if prompt.lower() == 'exit' or prompt.lower() == 'bye' or (one_shot and not truncated):
       break
@@ -160,18 +294,20 @@ def chat(prompt: str, model: str, one_shot: bool):
 
       assistant_message = f"{reasoning}\n\n{answer}".strip()
       conversation.append({ 'role': 'assistant', 'content': assistant_message })
-      prompt = 'Please continue.'
+      conversation.append({ 'role': 'user', 'content': 'Please continue.' })
       truncation_count += 1
+      ask_prompt = False
     else:
       conversation.append({ 'role': 'assistant', 'content': answer })
       truncation_count = 0
-      prompt = ''
+      ask_prompt = True
 
-    # to keep tokens down, summarise oldest messages in the conversation with a summary of those messages
+    # to keep tokens down, compact oldest messages in the conversation, replacing with a summary of those messages
     if len(conversation) > 20:
       summary = get_summary(creds, conversation[1:11])   # ignoring initial system prompt, summarise oldest 10 messages (i.e. 5 exchanges)
       summary_message = { 'role': 'assistant', 'content': summary }
       conversation = [system_message] + [summary_message] + conversation[11:]
+      print(BR_CYAN + 'Conversation compacted.' + COL_END + '\n')
 
 
 def image_to_text(prompt: str, image_filename: str, one_shot: bool):
@@ -188,13 +324,15 @@ def image_to_text(prompt: str, image_filename: str, one_shot: bool):
   creds = get_creds()
   model = 'llava'
   result = post_llm_request(creds, model, payload)
-  answer, _, _ = parse_result(model, result)
+  answer, _, _, _ = parse_result(model, result)
   print_markdown(answer)
 
 
 
 
 try:
+  connect_mcp_server()
+
   parser = argparse.ArgumentParser(description='Ask: your personal command line chatbot')
   parser.add_argument('text', type=str, nargs='*', default=[], help='initial question to ask.')
   parser.add_argument('-q', '--quick', action='store_true', help='quick mode. Ask a single question then exit. If not set, defaults to conversation mode.')
