@@ -11,6 +11,7 @@ from prompt_toolkit import PromptSession, ANSI
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.client.stdio import stdio_client, StdioServerParameters
+from mcp.types import Tool
 import mdv
 
 GREEN   = '\033[92m'
@@ -24,14 +25,21 @@ COL_END = '\033[0m'
 #   http:  { 'transport': 'http', 'url': 'http://localhost:8000/mcp' }
 #   stdio: { 'transport': 'stdio', 'command': 'npx', 'args': ['-y', '@modelcontextprotocol/server-filesystem', '/path/to/allowed/directory'] }
 MCP_SERVER_CONFIG = {
-  'transport': 'stdio',
-  'command': 'npx',
-  'args': ['-y', '@modelcontextprotocol/server-filesystem', '/mnt/data/workspace/sandbox']
+  'filesystem': {
+    'transport': 'stdio',
+    'command': 'npx',
+    'args': ['-y', '@modelcontextprotocol/server-filesystem', '/mnt/data/workspace/sandbox']
+  },
+  'ripgrep': {
+    'transport': 'stdio',
+    'command': 'npx',
+    'args': ['-y', 'mcp-ripgrep@latest']
+  },
 }
 
 
-# tools fetched from the MCP server at startup (list of mcp.types.Tool)
-mcp_tools = []
+# tools fetched from MCP servers at startup: a flat list of (server_name, tool) tuples
+mcp_tools: list[tuple[str, Tool]] = []
 
 
 @asynccontextmanager
@@ -71,14 +79,17 @@ async def _call_mcp_tool(config: dict, tool_function: str, tool_args: dict) -> d
     text = ''.join(block.text for block in result.content if block.type == 'text')
     return { 'result': text }
 
-def connect_mcp_server(config: dict = MCP_SERVER_CONFIG):
+def connect_mcp_servers(config: dict = MCP_SERVER_CONFIG):
   # connect to the MCP server, fetch its tool list, then disconnect
   global mcp_tools
-  try:
-    mcp_tools = asyncio.run(_fetch_mcp_tools(config))
-  except Exception as err:
-    print(RED + f'Failed to connect to MCP server ({config.get("transport")}): {err}' + COL_END)
-    mcp_tools = []
+  mcp_tools = []
+  for server_name in config:
+    try:
+      tools = asyncio.run(_fetch_mcp_tools(config[server_name]))
+      for tool in tools:
+        mcp_tools.append((server_name, tool))
+    except Exception as err:
+      print(RED + f'Failed to connect to MCP server ({config[server_name].get("transport")}): {err}' + COL_END)
 
 
 MODELS = {
@@ -110,11 +121,11 @@ def get_tools() -> list[dict]:
   # append any tools discovered from the connected MCP server, converted to
   # the OpenAI-compatible function-calling schema.
   tools = []
-  for tool in mcp_tools:
+  for server_name, tool in mcp_tools:
     tools.append({
       'type': 'function',
       'function': {
-        'name': tool.name,
+        'name': f'{server_name}__{tool.name}',
         'description': tool.description or '',
         'parameters': tool.input_schema
       }
@@ -125,7 +136,8 @@ def get_tools() -> list[dict]:
 def run_tool(tool_function, tool_args) -> dict:
   # call the tool on the connected MCP server and return its result.
   try:
-    return asyncio.run(_call_mcp_tool(MCP_SERVER_CONFIG, tool_function, tool_args))
+    server_name, function_name = tool_function.split('__',1)
+    return asyncio.run(_call_mcp_tool(MCP_SERVER_CONFIG[server_name], function_name, tool_args))
   except Exception as err:
     print(RED + f'Failed to call MCP tool {tool_function}: {err}' + COL_END)
     return { 'error': str(err) }
@@ -166,7 +178,7 @@ def prompt_llm(creds: dict[str, str], model: str, messages: list[dict[str, str]]
 
   result = post_llm_request(creds, model, payload)
   if result is None:
-    return '','',False
+    return '','',False,[]
   return parse_result(model, result)
 
 
@@ -263,10 +275,8 @@ def chat(prompt: str, model: str, one_shot: bool):
       for tc in tool_calls:
         fn = tc['function']['name']
         args = json.loads(tc['function']['arguments'])
-        print(BR_CYAN + 'Calling tool: ' + fn + COL_END + '\n')
+        print(BR_CYAN + 'Calling tool: ' + fn.replace('__', ' ') + COL_END + '\n')
         tool_result = run_tool(fn, args) 
-        print(BR_CYAN + 'Tool results: ' + json.dumps(tool_result) + COL_END + '\n')
-
         conversation.append({ 'role': 'tool', 'tool_call_id': tc['id'], 'content': json.dumps(tool_result) })
       ask_prompt = False
       continue
@@ -331,7 +341,6 @@ def image_to_text(prompt: str, image_filename: str, one_shot: bool):
 
 
 try:
-  connect_mcp_server()
 
   parser = argparse.ArgumentParser(description='Ask: your personal command line chatbot')
   parser.add_argument('text', type=str, nargs='*', default=[], help='initial question to ask.')
@@ -350,6 +359,7 @@ try:
       argparse.ArgumentParser().error(f"Image file '{args.image}' not found.")
     image_to_text(prompt, args.image, args.quick)
   else:
+    connect_mcp_servers()
     chat(prompt, args.model, args.quick)
 except (KeyboardInterrupt, EOFError):
   print(RED + '\nExiting...' + COL_END + '\n')
