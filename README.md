@@ -91,3 +91,7 @@ You can provide your own prompt for a more specific description:
 ./ask.py -i vinyl.jpg Please extract the artist, title and record label
 ```
 
+## MCP servers
+
+You can configure the chatbot to use MCP servers for tools such as filesystem search or web fetch. To do this, create a `mcp.json` file in the same directory as the main script and add your MCP configuration. The JSON format closely matches Claude Desktop's MCP Server config. See the [example MCP config](./mcp.json.example).
+

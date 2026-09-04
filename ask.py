@@ -18,25 +18,12 @@ GREEN   = '\033[92m'
 CYAN    = '\033[36m'
 BR_CYAN = '\033[96m'
 RED     = '\033[31m'
+DK_GREY = '\033[90m'
 COL_END = '\033[0m'
 
-# MCP server config. Hardcoded for now.
-# 'transport' is either 'http' or 'stdio':
-#   http:  { 'transport': 'http', 'url': 'http://localhost:8000/mcp' }
-#   stdio: { 'transport': 'stdio', 'command': 'npx', 'args': ['-y', '@modelcontextprotocol/server-filesystem', '/path/to/allowed/directory'] }
-MCP_SERVER_CONFIG = {
-  'filesystem': {
-    'transport': 'stdio',
-    'command': 'npx',
-    'args': ['-y', '@modelcontextprotocol/server-filesystem', '/mnt/data/workspace/sandbox']
-  },
-  'ripgrep': {
-    'transport': 'stdio',
-    'command': 'npx',
-    'args': ['-y', 'mcp-ripgrep@latest']
-  },
-}
 
+# MCP server config, read from mcp.json file at startup
+mcp_server_config: dict = {}
 
 # tools fetched from MCP servers at startup: a flat list of (server_name, tool) tuples
 mcp_tools: list[tuple[str, Tool]] = []
@@ -44,10 +31,15 @@ mcp_tools: list[tuple[str, Tool]] = []
 
 @asynccontextmanager
 async def _mcp_session(config: dict):
-  # open a connection to the MCP server (using whichever transport is
-  # configured) and yield an initialized session.
-  transport = config.get('transport', 'http')
+  # determine the type of transport from the server's config
+  if config.get('command'):
+    transport = 'stdio' 
+  elif config.get('url'):
+    transport = 'http'
+  else:
+    transport = None
 
+  # open a connection to the MCP server and yield an initialized session
   if transport == 'stdio':
     params = StdioServerParameters(command=config['command'], args=config.get('args', []), env=config.get('env'), cwd=config.get('cwd'))
     with open(os.devnull, 'w') as devnull:
@@ -57,13 +49,13 @@ async def _mcp_session(config: dict):
           yield session
 
   elif transport == 'http':
-    async with streamable_http_client(config['url']) as (read_stream, write_stream, _):
+    async with streamable_http_client(config['url']) as (read_stream, write_stream):
       async with ClientSession(read_stream, write_stream) as session:
         await session.initialize()
         yield session
 
   else:
-    raise ValueError(f"Unknown MCP transport '{transport}'")
+    raise ValueError(f"invalid MCP server config")
 
 async def _fetch_mcp_tools(config: dict) -> list:
   async with _mcp_session(config) as session:
@@ -79,18 +71,72 @@ async def _call_mcp_tool(config: dict, tool_function: str, tool_args: dict) -> d
     text = ''.join(block.text for block in result.content if block.type == 'text')
     return { 'result': text }
 
-def connect_mcp_servers(config: dict = MCP_SERVER_CONFIG):
+def connect_mcp_servers():
   # connect to the MCP server, fetch its tool list, then disconnect
   global mcp_tools
   mcp_tools = []
-  for server_name in config:
+  if not mcp_server_config:
+    return
+  
+  for server_name in mcp_server_config:
+    print(f'{DK_GREY}Connecting to MCP server: {server_name}{COL_END} ', end='', flush=True)
     try:
-      tools = asyncio.run(_fetch_mcp_tools(config[server_name]))
+      tools = asyncio.run(_fetch_mcp_tools(mcp_server_config[server_name]))
       for tool in tools:
         mcp_tools.append((server_name, tool))
+      print(f'{DK_GREY}✔{COL_END}')
     except Exception as err:
-      print(RED + f'Failed to connect to MCP server ({config[server_name].get("transport")}): {err}' + COL_END)
+      print(f'{DK_GREY}✘\n{RED}Failed to connect to MCP server {server_name}: {err}{COL_END}')
 
+def _validate_mpc_server_config(config) -> str | None:
+  if not isinstance(config, dict):
+    return "entry must be an object"
+
+  has_command = bool(config.get('command'))
+  has_url = bool(config.get('url'))
+
+  if not has_command and not has_url:
+    return "must have either 'command' (stdio) or 'url' (http)"
+
+  if has_command:
+    if not isinstance(config['command'], str):
+      return "'command' must be a string"
+    if 'args' in config and not isinstance(config['args'], list):
+      return "'args' must be a list"
+    if 'env' in config and not isinstance(config['env'], dict):
+      return "'env' must be an object"
+    if 'cwd' in config and not isinstance(config['cwd'], str):
+      return "'cwd' must be a string"
+
+  if has_url and not isinstance(config['url'], str):
+    return "'url' must be a string"
+
+  return None
+
+def load_mcp_config() -> dict:
+  # read the mcp servers config from json file
+  global mcp_server_config
+  # default to no mcp servers if file not found or other error in config
+  mcp_server_config = {}
+
+  # config path should be in same dir as this script
+  path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'mcp.json')
+  try:
+    with open(path, 'r') as f:
+      mcp_config = json.load(f)
+  except FileNotFoundError:
+    pass
+  except json.JSONDecodeError:
+    print(RED + f'MCP server config file: {path} does not contain valid JSON. MCP servers will not be used.' + COL_END)
+  else:
+    servers = mcp_config.get('mcpServers') or {}
+    for server_name, server_cfg in servers.items():
+      err = _validate_mpc_server_config(server_cfg)
+      if err:
+        print(RED + f'Invalid MCP server config for {server_name}: {err}. MCP server will not be used.' + COL_END)
+      else:
+        mcp_server_config[server_name] = server_cfg
+  
 
 MODELS = {
   'gemma'         : { 'name': '@cf/google/gemma-4-26b-a4b-it', 'schema': 'openai' },
@@ -137,7 +183,7 @@ def run_tool(tool_function, tool_args) -> dict:
   # call the tool on the connected MCP server and return its result.
   try:
     server_name, function_name = tool_function.split('__',1)
-    return asyncio.run(_call_mcp_tool(MCP_SERVER_CONFIG[server_name], function_name, tool_args))
+    return asyncio.run(_call_mcp_tool(mcp_server_config[server_name], function_name, tool_args))
   except Exception as err:
     print(RED + f'Failed to call MCP tool {tool_function}: {err}' + COL_END)
     return { 'error': str(err) }
@@ -228,7 +274,7 @@ def print_markdown(text: str):
 
 def chat(prompt: str, model: str, one_shot: bool):
   creds = get_creds()
-  system_message = { 'role': 'system', 'content': "You are a helpful assistant called Bob. Please answer questions briefly and professionally, without asking follow up questions. Format all responses using markdown. You must finish each answer with a '⏎' stop character." }
+  system_message = { 'role': 'system', 'content': "You are a helpful assistant called Bob. Please answer questions briefly and professionally, without asking follow up questions. Format all responses using markdown. Don't use markdown tables for large amounts of text. You must finish each answer with a '⏎' stop character." }
   conversation = []
   conversation.append(system_message)
 
@@ -275,7 +321,7 @@ def chat(prompt: str, model: str, one_shot: bool):
       for tc in tool_calls:
         fn = tc['function']['name']
         args = json.loads(tc['function']['arguments'])
-        print(BR_CYAN + 'Calling tool: ' + fn.replace('__', ' ') + COL_END + '\n')
+        print(f'{DK_GREY}Calling tool: {fn.replace('__', ' ')} {args}{COL_END}\n')
         tool_result = run_tool(fn, args) 
         conversation.append({ 'role': 'tool', 'tool_call_id': tc['id'], 'content': json.dumps(tool_result) })
       ask_prompt = False
@@ -359,6 +405,7 @@ try:
       argparse.ArgumentParser().error(f"Image file '{args.image}' not found.")
     image_to_text(prompt, args.image, args.quick)
   else:
+    load_mcp_config()
     connect_mcp_servers()
     chat(prompt, args.model, args.quick)
 except (KeyboardInterrupt, EOFError):

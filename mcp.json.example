@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": [ "-y", "@modelcontextprotocol/server-filesystem", "/mnt/sandbox" ]
+    },
+    "ripgrep": {
+      "command": "npx",
+      "args": ["-y", "mcp-ripgrep@latest" ],
+      "cwd": "/mnt/sandbox/my-project"
+    },
+    "web-fetch": {
+      "command": "npx",
+      "args": ["mcp-fetch-server"]
+    }
+  }
+}
