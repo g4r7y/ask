@@ -1,3 +1,4 @@
 cf-creds.sh
 mcp.json
 *env/
+__pycache__/
