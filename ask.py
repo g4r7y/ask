@@ -2,6 +2,7 @@
 
 import inspect
 import os
+import re
 import shutil
 import sys
 import requests
@@ -352,9 +353,97 @@ def get_summary(creds: dict[str, str], messages: list[dict[str, str]]):
   answer, _, _, _ = prompt_llm(creds, 'llama-small', messages, 1)
   return answer
 
+# ---------- Markdown handling ------------------------------------------------
+
+def split_table_cells(line: str) -> list[str]:
+  """Split a markdown table row into its cells, respecting escaped pipes."""
+  line = line.strip()
+  cells = re.split(r'(?<!\\)\|', line)
+  # the outer pipes produce empty cells at each end, which are not real columns
+  if line.startswith('|'):
+    cells = cells[1:]
+  if line.endswith('|') and len(cells) > 1:
+    cells = cells[:-1]
+  return [cell.strip().replace('\\|', '|') for cell in cells]
+
+
+def strip_emphasis(cell: str) -> str:
+  """Remove any emphasis markers wrapping a whole cell.
+  The first column of a table is often bold, so this needs to be stripped to avoid
+  us adding double emphasis later.
+  """
+  cell = cell.strip()
+  for marker in ('***', '**', '*', '__', '_'):
+    while len(cell) > 2 * len(marker) and cell.startswith(marker) and cell.endswith(marker):
+      cell = cell[len(marker):-len(marker)].strip()
+  return cell
+
+
+def is_table_alignment_row(line: str) -> bool:
+  """Check for the |---|:--:| second line of a markdown table."""
+  line = line.strip()
+  return line.startswith('|') and '-' in line and re.fullmatch(r'[\s|:-]+', line) is not None
+
+
+def transpose_table(table_lines: list[str], width: int) -> list[str]:
+  """Rewrite a markdown table into a transpose form, if it is too wide for the terminal.
+  Each row is rewritten into several lines containing that row's content. The first line 
+  becomes a heading (the first cell in the row), followed by a labelled list of the remaining
+  cells. Tables that already fit the terminal width are returned as is.
+  """
+  headers = [strip_emphasis(cell) for cell in split_table_cells(table_lines[0])]
+  rows = [[strip_emphasis(cell) for cell in split_table_cells(line)] for line in table_lines[2:]]
+  if len(headers) < 2 or not rows:
+    return table_lines
+
+  # ragged rows are padded so every row lines up with the headers
+  rows = [row + [''] * (len(headers) - len(row)) for row in rows]
+
+  # mdv indents by 2 and separates columns by 2, so that is the narrowest it could draw
+  columns = [max(len(row[i]) for row in [headers] + rows) for i in range(len(headers))]
+  if sum(columns) + 2 * len(headers) <= width:
+    return table_lines
+
+  records = []
+  for row in rows:
+    records.append(f'**{row[0]}**' if row[0] else '**—**')
+    records.append('')
+    for label, cell in zip(headers[1:], row[1:]):
+      if cell:
+        records.append(f'- **{label}:** {cell}')
+    records.append('')
+  return records
+
+def transform_wide_tables(text: str, width: int) -> str:
+  """Transform any markdown table that is too wide for the terminal, so that mdv doesn't split the
+  table into unreadable rows. Replaces each table row with a transposed equivalent over multiple lines.
+  """
+  lines = text.split('\n')
+  output = []
+  in_fence = False
+  index = 0
+  while index < len(lines):
+    line = lines[index]
+    if line.lstrip().startswith('```'):
+      in_fence = not in_fence
+    # a table is a header row followed by an alignment row, then its body
+    elif not in_fence and line.strip().startswith('|') \
+        and index + 1 < len(lines) and is_table_alignment_row(lines[index + 1]):
+      end = index
+      while end < len(lines) and lines[end].strip().startswith('|'):
+        end += 1
+      output.extend(transpose_table(lines[index:end], width))
+      index = end
+      continue
+    output.append(line)
+    index += 1
+  return '\n'.join(output)
+
 def render_markdown(text: str) -> str:
   """Convert markdown to ANSI."""
-  return mdv.main(text, theme='963.4449') #theme='757.2295'
+  width = shutil.get_terminal_size((80, 24)).columns
+  text = transform_wide_tables(text, width)
+  return mdv.main(text, cols=width, theme='963.4449') #theme='757.2295'
 
 
 def split_markdown_blocks(text: str) -> tuple[list[str], str]:
@@ -383,7 +472,7 @@ def split_markdown_blocks(text: str) -> tuple[list[str], str]:
       consumed = index + 1
   return blocks, '\n'.join(lines[consumed:])
 
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 class StreamPrinter:
   """Prints text deltas as they arrive. Each time a markdown block is completed its
@@ -491,7 +580,7 @@ class Chat:
   def start(self, initial_prompt: str, model: str, one_shot: bool):
     self.creds = get_creds()
     self.model = model
-    self.system_message = { 'role': 'system', 'content': "You are a helpful assistant called Bob. Please answer questions briefly and professionally, without asking follow up questions. Format all responses using markdown. Don't use markdown tables for large amounts of text. You must finish each answer with a '⏎' stop character." }
+    self.system_message = { 'role': 'system', 'content': "You are a helpful assistant called Bob. Please answer questions briefly and professionally, without asking follow up questions. Format all responses using markdown. Don't use markdown tables with more than 4 columns. You must finish each answer with a '⏎' stop character." }
     self.conversation.append(self.system_message)
     prompt = initial_prompt
 
