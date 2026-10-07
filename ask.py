@@ -30,6 +30,9 @@ MODELS = {
 # when size of conversation exceeds this threshold the conversation will be compacted to reduce token usage
 AUTO_COMPACT_THRESHOLD = 25
 
+# the system prompt asks for this character at the end of each answer, so we can detect truncation
+STOP_CHAR = '⏎'
+
 GREEN   = '\033[92m'
 CYAN    = '\033[36m'
 BR_CYAN = '\033[96m'
@@ -319,16 +322,18 @@ def streaming_llm_request(creds: dict[str, str], model: str, payload: dict, on_t
     for _, frag in sorted(tool_frags.items()) if frag['name']
   ]
 
-  if schema == 'openai':
-    # some backends report truncation as 'model_length' rather than 'length'
-    truncated = finish_reason in ('length', 'model_length')
-  else:
+  if schema == 'llama':
     # our system prompt asks to append special stop char, so if it's not there then response is (probably) truncated
-    truncated = '⏎' not in answer[-10:] and len(answer) > 800
+    truncated = STOP_CHAR not in answer[-10:] and len(answer) > 800
+    # strip the stop char from the answer
+    answer = answer.rstrip().removesuffix(STOP_CHAR).rstrip()
+  else:
+    # openai models report truncation as either 'model_length' or 'length'
+    truncated = finish_reason in ('length', 'model_length')
 
   return answer, reasoning, truncated, tool_calls
 
-def prompt_llm(creds: dict[str, str], model: str, messages: list[dict[str, str]], token_multiplier: int, on_text=None, on_reasoning=None):
+def prompt_llm(creds: dict[str, str], model: str, messages: list[dict[str, str]], on_text=None, on_reasoning=None):
   payload = { 
     'messages': messages
   }
@@ -336,8 +341,8 @@ def prompt_llm(creds: dict[str, str], model: str, messages: list[dict[str, str]]
   if MODELS[model]['schema'] == 'openai':
     # assuming all our 'openai' type models support tool calling
     payload['tools'] = get_tools()
-    # set truncation limit (unlike llama, don't need to rely on missing stop character to identify truncation)
-    payload['max_tokens'] = 512 + 200 * token_multiplier
+    # set generous truncation limit (unlike llama, we don't expect early truncation)
+    payload['max_tokens'] = 2048
 
   # all our chat models support streaming
   result = streaming_llm_request(creds, model, payload, on_text, on_reasoning)
@@ -350,7 +355,7 @@ def get_summary(creds: dict[str, str], messages: list[dict[str, str]]):
   system_message = { 'role': 'system', 'content': 'You are a concise chat bot' }
   user_message = { 'role': 'user', 'content': 'Condense the conversation history into a brief summary (100 words or less) that captures the essential information and context, focussing mainly on details provided by the user' }
   messages = [system_message] + messages + [user_message]
-  answer, _, _, _ = prompt_llm(creds, 'llama-small', messages, 1)
+  answer, _, _, _ = prompt_llm(creds, 'llama-small', messages)
   return answer
 
 # ---------- Markdown handling ------------------------------------------------
@@ -570,21 +575,27 @@ class StreamPrinter:
 # ----------------------------------------------------------------------------
 
 class Chat:
-  def __init__(self):
+  def __init__(self, initial_model: str):
     self.conversation = []
     self.creds = {}
-    self.system_message = {}
-    self.model = ''
+    self.model = initial_model
     self.done = False
 
-  def start(self, initial_prompt: str, model: str, one_shot: bool):
+  def _system_message(self):
+    main_clause = "You are a helpful assistant called Bob. Please answer questions briefly and professionally, without asking follow up questions. Format all responses using markdown. Don't use markdown tables with more than 4 columns."
+    stop_clause = f" You must finish each answer with a '{STOP_CHAR}' stop character."
+    prompt = main_clause + (stop_clause if (MODELS[self.model]['schema'] == 'llama') else '')
+    return {
+      'role': 'system',
+      'content': prompt
+    }
+
+  def start(self, initial_prompt: str, one_shot: bool):
     self.creds = get_creds()
-    self.model = model
-    self.system_message = { 'role': 'system', 'content': "You are a helpful assistant called Bob. Please answer questions briefly and professionally, without asking follow up questions. Format all responses using markdown. Don't use markdown tables with more than 4 columns. You must finish each answer with a '⏎' stop character." }
-    self.conversation.append(self.system_message)
+    self.conversation.append(self._system_message())
     prompt = initial_prompt
 
-    # Long responses will be truncated, so when we detect truncation we do a continuation prompt.
+    # Long responses from llama will be truncated, so when we detect truncation we do a continuation prompt.
     # System prompt asks for a stop character so we can detect truncation, or for OpenAI etc. we check for it reaching max_tokens.
     # Either way, we limit the number of continuation requests in case the model fails to stop.
     truncated = False
@@ -609,15 +620,14 @@ class Chat:
         )
         prompt = session.prompt()
         if (prompt[:1] == '/'):
-          self.dispatch_command(prompt[1:].lower())
+          self._dispatch_command(prompt[1:].lower())
           ask_prompt = True
           continue
           
         self.conversation.append({ 'role': 'user', 'content': prompt })
 
-      token_multiplier = truncation_count if truncated else 1
       printer = StreamPrinter()
-      answer, reasoning, truncated, tool_calls = prompt_llm(self.creds, model, self.conversation, token_multiplier, printer.on_text, printer.on_reasoning)
+      answer, reasoning, truncated, tool_calls = prompt_llm(self.creds, self.model, self.conversation, printer.on_text, printer.on_reasoning)
       printer.finish()
       
       if tool_calls:
@@ -670,7 +680,7 @@ class Chat:
 
   def clear(self):
     self.conversation = []
-    self.conversation.append(self.system_message)
+    self.conversation.append(self._system_message())
     print(f'{BR_CYAN}Conversation cleared.{COL_END}')
 
   def compact(self):
@@ -686,7 +696,7 @@ class Chat:
     # keeping initial system prompt, summarise oldest messages
     summary = get_summary(self.creds, self.conversation[1:compaction_index])
     summary_message = { 'role': 'assistant', 'content': summary }
-    self.conversation = [self.system_message] + [summary_message] + self.conversation[compaction_index:]
+    self.conversation = [self._system_message()] + [summary_message] + self.conversation[compaction_index:]
     print(f'{BR_CYAN}Conversation compacted.{COL_END}')
 
   def set_model(self, cmd_args):
@@ -699,18 +709,21 @@ class Chat:
       print(f'{BR_CYAN}Available models: {', '.join(chat_models)}{COL_END}')
     else:
       self.model = cmd_args[0]
+      if len(self.conversation) > 0:
+        # system message can be model dependent, so update it
+        self.conversation[0] = self._system_message()
       print(f'{BR_CYAN}Model changed to: {self.model}{COL_END}')
 
-  def exit(self):
+  def _quit(self):
     self.done = True
     print(f'{BR_CYAN}Bye!{COL_END}')
 
-  def dispatch_command(self, command: str):
+  def _dispatch_command(self, command: str):
     commands = {
       'clear': self.clear,
       'compact': self.compact,
       'model': self.set_model,
-      'exit': self.exit,
+      'exit': self._quit,
     }
 
     cmd_parts = command.split(' ')
@@ -763,8 +776,8 @@ try:
   else:
     load_mcp_config()
     connect_mcp_servers()
-    chat = Chat()
-    chat.start(prompt, args.model, args.quick)
+    chat = Chat(args.model)
+    chat.start(prompt, args.quick)
 except (KeyboardInterrupt, EOFError):
   print(RED + '\nExiting...' + COL_END + '\n')
   sys.exit(0)
