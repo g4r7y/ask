@@ -650,7 +650,7 @@ class Chat:
         if tool_call_start is None:
           tool_call_start = len(self.conversation)
         assistant_message = { 'role': 'assistant', 'content': '', 'tool_calls': tool_calls }
-        if reasoning:
+        if reasoning: # add chain-of-thought to assistant message - needed for tool calls next time round
           assistant_message[reasoning_key] = reasoning
         self.conversation.append(assistant_message)
         for tc in tool_calls:
@@ -676,6 +676,10 @@ class Chat:
         print(f'No response, try again.\n')
         if one_shot:
           exit()
+        if truncation_count > 0:
+          # abandon continuation, remove the last 'Please continue' prompt from history
+          self.conversation = self.conversation[:-1]
+          truncation_count = 0
         ask_prompt = True
         continue
 
@@ -685,19 +689,22 @@ class Chat:
         exit()
         continue
 
+      assistant_content = answer
+      if truncation_count > 0:
+        # we've already done a continuation prompt, so strip the last assistant and user prompt from history,
+        # and concat the previous partial answer with the current continued answer
+        previous = self.conversation[-2]['content']
+        self.conversation = self.conversation[:-2]
+        assistant_content = previous + answer
+
+      self.conversation.append({ 'role': 'assistant', 'content': assistant_content })
+
       if truncated:
         print(f'...\n')
-        if truncation_count > 0:
-          # already done a continuation prompt, so strip the last user and assistant prompt
-          self.conversation = self.conversation[:-2]
-
-        assistant_message = f"{reasoning}\n\n{answer}".strip()
-        self.conversation.append({ 'role': 'assistant', 'content': assistant_message })
         self.conversation.append({ 'role': 'user', 'content': 'Please continue.' })
         truncation_count += 1
         ask_prompt = False
       else:
-        self.conversation.append({ 'role': 'assistant', 'content': answer })
         truncation_count = 0
         ask_prompt = True
 
