@@ -247,6 +247,8 @@ def streaming_llm_request(creds: dict[str, str], model: str, payload: dict, on_t
   schema = MODELS[model]['schema']
   answer = ''
   reasoning = ''
+  # the key used in the model api for reasoning (varies between models)
+  reasoning_key = 'reasoning_content'
   finish_reason = None
   # tool call fragments, keyed by their index in the response, accumulated across chunks
   tool_frags: dict[int, dict] = {}
@@ -283,14 +285,24 @@ def streaming_llm_request(creds: dict[str, str], model: str, payload: dict, on_t
             on_text(text)
 
           # some models have 'reasoning', others have 'reasoning_content'
-          thinking = as_text(delta.get('reasoning_content')) or as_text(delta.get('reasoning')) or ''
-          if thinking:
-            reasoning += thinking
-            on_reasoning(thinking)
+          for key in ('reasoning_content', 'reasoning'):
+            thinking = as_text(delta.get(key)) or ''
+            if thinking:
+              # remember which key this model uses, so we can echo it back when making tool calls
+              reasoning_key = key
+              reasoning += thinking
+              on_reasoning(thinking)
+              break
 
           for tc in delta.get('tool_calls') or []:
-            index = tc.get('index', len(tool_frags))
-            frag = tool_frags.setdefault(index, { 'id': None, 'name': None, 'arguments': '' })
+            index = tc.get('index')
+            if index is None:
+              index = max(tool_frags) if tool_frags else 0
+            if index not in tool_frags:
+              # create new tool frag
+              tool_frags[index] = { 'id': None, 'name': None, 'arguments': '' }
+            frag = tool_frags[index]  
+            # populate tool frag from tool_call chunk                                                                                                                                                             ┃
             if tc.get('id'):
               frag['id'] = tc['id']
             function = tc.get('function') or {}
@@ -318,8 +330,12 @@ def streaming_llm_request(creds: dict[str, str], model: str, payload: dict, on_t
     print(f'\n{RED}Response stream ended unexpectedly.{COL_END}')
 
   tool_calls = [
-    { 'id': frag['id'], 'type': 'function', 'function': { 'name': frag['name'], 'arguments': frag['arguments'] or '{}' } }
-    for _, frag in sorted(tool_frags.items()) if frag['name']
+    {
+      'id': frag['id'] or f'call_{index}',
+      'type': 'function',
+      'function': { 'name': frag['name'], 'arguments': frag['arguments'] or '{}' }
+    }
+    for index, frag in sorted(tool_frags.items()) if frag['name']
   ]
 
   if schema == 'llama':
@@ -331,7 +347,7 @@ def streaming_llm_request(creds: dict[str, str], model: str, payload: dict, on_t
     # openai models report truncation as either 'model_length' or 'length'
     truncated = finish_reason in ('length', 'model_length')
 
-  return answer, reasoning, truncated, tool_calls
+  return answer, reasoning, reasoning_key, truncated, tool_calls
 
 def prompt_llm(creds: dict[str, str], model: str, messages: list[dict[str, str]], on_text=None, on_reasoning=None):
   payload = { 
@@ -347,7 +363,7 @@ def prompt_llm(creds: dict[str, str], model: str, messages: list[dict[str, str]]
   # all our chat models support streaming
   result = streaming_llm_request(creds, model, payload, on_text, on_reasoning)
   if result is None:
-    return '','',False,[]
+    return '','','reasoning_content',False,[]
   return result
 
 def get_summary(creds: dict[str, str], messages: list[dict[str, str]]):
@@ -355,7 +371,7 @@ def get_summary(creds: dict[str, str], messages: list[dict[str, str]]):
   system_message = { 'role': 'system', 'content': 'You are a concise chat bot' }
   user_message = { 'role': 'user', 'content': 'Condense the conversation history into a brief summary (100 words or less) that captures the essential information and context, focussing mainly on details provided by the user' }
   messages = [system_message] + messages + [user_message]
-  answer, _, _, _ = prompt_llm(creds, 'llama-small', messages)
+  answer, *_ = prompt_llm(creds, 'llama-small', messages)
   return answer
 
 # ---------- Markdown handling ------------------------------------------------
@@ -627,19 +643,22 @@ class Chat:
         self.conversation.append({ 'role': 'user', 'content': prompt })
 
       printer = StreamPrinter()
-      answer, reasoning, truncated, tool_calls = prompt_llm(self.creds, self.model, self.conversation, printer.on_text, printer.on_reasoning)
+      answer, reasoning, reasoning_key, truncated, tool_calls = prompt_llm(self.creds, self.model, self.conversation, printer.on_text, printer.on_reasoning)
       printer.finish()
       
       if tool_calls:
         if tool_call_start is None:
           tool_call_start = len(self.conversation)
-        self.conversation.append({ 'role': 'assistant', 'content': '', 'tool_calls': tool_calls })
+        assistant_message = { 'role': 'assistant', 'content': '', 'tool_calls': tool_calls }
+        if reasoning:
+          assistant_message[reasoning_key] = reasoning
+        self.conversation.append(assistant_message)
         for tc in tool_calls:
           fn = tc['function']['name']
           args = json.loads(tc['function']['arguments'])
-          print(f'{DK_GREY}Calling tool: {fn.replace('__', ' ')} {args}{COL_END}')
+          print(f"{DK_GREY}Calling tool: {fn.replace("__", " ")} {args}{COL_END}")
           tool_result = run_tool(fn, args) 
-          self.conversation.append({ 'role': 'tool', 'tool_call_id': tc['id'], 'content': json.dumps(tool_result) })
+          self.conversation.append({ 'role': 'tool', 'tool_call_id': tc['id'], 'name': fn, 'content': json.dumps(tool_result) })
         ask_prompt = False
         continue
       
@@ -651,6 +670,14 @@ class Chat:
       
       if answer is None:
         answer = ''
+
+      if not answer.strip():
+        # no answer and no tool calls, so there is nothing to add to the conversation
+        print(f'No response, try again.\n')
+        if one_shot:
+          exit()
+        ask_prompt = True
+        continue
 
       truncated = truncated and truncation_count < TRUNCATION_LIMIT
 
@@ -703,10 +730,10 @@ class Chat:
     chat_models = [key for key, value in MODELS.items() if value['schema'] != 'image_description']
     if len(cmd_args)==0:
       print(f'{BR_CYAN}Current model: {self.model}{COL_END}')
-      print(f'{BR_CYAN}Available models: {', '.join(chat_models)}{COL_END}')
+      print(f'{BR_CYAN}Available models: {", ".join(chat_models)}{COL_END}')
     elif cmd_args[0] not in chat_models:
       print(f'{BR_CYAN}Invalid model name.{COL_END}')
-      print(f'{BR_CYAN}Available models: {', '.join(chat_models)}{COL_END}')
+      print(f'{BR_CYAN}Available models: {", ".join(chat_models)}{COL_END}')
     else:
       self.model = cmd_args[0]
       if len(self.conversation) > 0:
@@ -734,7 +761,7 @@ class Chat:
       else:
         handler(cmd_parts[1:])
     else:
-      print(f'{BR_CYAN}Available commands: {', '.join(commands.keys())}{COL_END}')
+      print(f'{BR_CYAN}Available commands: {", ".join(commands.keys())}{COL_END}')
     print('')
       
 
