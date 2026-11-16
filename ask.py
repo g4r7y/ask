@@ -22,6 +22,8 @@ MODELS = {
   'gpt'           : { 'name': '@cf/openai/gpt-oss-20b', 'schema': 'openai' },
   'gpt-large'     : { 'name': '@cf/openai/gpt-oss-120b', 'schema': 'openai' },
   'nemotron-large': { 'name': '@cf/nvidia/nemotron-3-120b-a12b', 'schema': 'openai' },
+  'qwen-3.8'      : { 'name': '@cf/qwen/qwen3.8-27b', 'schema': 'openai' },
+  'glm-4.7-flash' : { 'name': '@cf/zai-org/glm-4.7-flash', 'schema': 'openai' },
   'llama-small'   : { 'name': '@cf/meta/llama-3.2-3b-instruct', 'schema': 'llama' },
   'llama'         : { 'name': '@cf/meta/llama-4-scout-17b-16e-instruct', 'schema': 'llama' },
   'llava'         : { 'name': '@cf/llava-hf/llava-1.5-7b-hf', 'schema': 'image_description' }
@@ -737,7 +739,9 @@ class Chat:
     chat_models = [key for key, value in MODELS.items() if value['schema'] != 'image_description']
     if len(cmd_args)==0:
       print(f'{BR_CYAN}Current model: {self.model}{COL_END}')
-      print(f'{BR_CYAN}Available models: {", ".join(chat_models)}{COL_END}')
+      print(f'{BR_CYAN}Available models:{COL_END}')
+      for model in chat_models:
+          print(f'{BR_CYAN}  {model}{COL_END}')
     elif cmd_args[0] not in chat_models:
       print(f'{BR_CYAN}Invalid model name.{COL_END}')
       print(f'{BR_CYAN}Available models: {", ".join(chat_models)}{COL_END}')
@@ -795,7 +799,7 @@ try:
   parser.add_argument('text', type=str, nargs='*', default=[], help='initial question to ask.')
   parser.add_argument('-q', '--quick', action='store_true', help='quick mode. Ask a single question then exit. If not set, defaults to conversation mode.')
   chat_models = [key for key, value in MODELS.items() if value['schema'] != 'image_description']
-  parser.add_argument('-m', '--model', type=str, default='llama', choices=chat_models,  help='choose which LLM to use for chat. Defaults to llama 4 17b model.')
+  parser.add_argument('-m', '--model', type=str, default='gpt', choices=chat_models,  help='choose which LLM to use for chat. Defaults to gpt model.')
   parser.add_argument('-i', '--image', type=str, default='',  help='path to an image file, for image-to-text inference (using llava model).')
   args = parser.parse_args()
   # take any command line text
