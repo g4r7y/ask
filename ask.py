@@ -190,8 +190,40 @@ def get_tools() -> list[dict]:
   return tools
 
 
+# tool permissions remembered for this session, keyed by '<server>__<tool>'
+allowed_tools: set[str] = set()
+denied_tools: set[str] = set()
+
+def approve_tool_call(tool_function: str, tool_args: dict) -> bool:
+  """Ask the user to approve a tool call, remembering 'always' answers for the session."""
+  if tool_function in denied_tools:
+    return False
+  if tool_function in allowed_tools:
+    return True
+  print(f"{CYAN}Tool call requested: {tool_function.replace('__', ' ')}{COL_END}")
+  print(f"{DK_GREY}{json.dumps(tool_args, indent=2, ensure_ascii=False)}{COL_END}")
+  while True:
+    try:
+      answer = input(f"{CYAN}Allow? [y]es / [n]o / [a]llow always / [d]eny always: {COL_END}").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+      print()
+      return False
+    if answer in ('y', 'yes'):
+      return True
+    if answer in ('n', 'no'):
+      return False
+    if answer in ('a', 'allow'):
+      allowed_tools.add(tool_function)
+      return True
+    if answer in ('d', 'deny'):
+      denied_tools.add(tool_function)
+      return False
+
+
 def run_tool(tool_function, tool_args) -> dict:
-  """Call the tool on the connected MCP server and return its result."""
+  """Call the tool on the connected MCP server and return its result, if the user approves."""
+  if not approve_tool_call(tool_function, tool_args):
+    return { 'error': 'The user denied permission to run this tool call.' }
   try:
     server_name, function_name = tool_function.split('__',1)
     return asyncio.run(_call_mcp_tool(mcp_server_config[server_name], function_name, tool_args))
