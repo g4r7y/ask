@@ -9,13 +9,14 @@ import requests
 import json
 import argparse
 import asyncio
+import mdv
 from contextlib import asynccontextmanager
 from prompt_toolkit import PromptSession, ANSI
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.types import Tool
-import mdv
+from requests.models import HTTPError
 
 MODELS = {
   'gemma'         : { 'name': '@cf/google/gemma-4-26b-a4b-it', 'schema': 'openai' },
@@ -148,13 +149,13 @@ def load_mcp_config() -> dict:
   except FileNotFoundError:
     pass
   except json.JSONDecodeError:
-    print(RED + f'MCP server config file: {path} does not contain valid JSON. MCP servers will not be used.' + COL_END)
+    print(f'{RED}MCP server config file: {path} does not contain valid JSON. MCP servers will not be used.{COL_END}')
   else:
     servers = mcp_config.get('mcpServers') or {}
     for server_name, server_cfg in servers.items():
       err = _validate_mpc_server_config(server_cfg)
       if err:
-        print(RED + f'Invalid MCP server config for {server_name}: {err}. MCP server will not be used.' + COL_END)
+        print(f'{RED}Invalid MCP server config for {server_name}: {err}. MCP server will not be used.{COL_END}')
       else:
         mcp_server_config[server_name] = server_cfg
 
@@ -242,6 +243,16 @@ def as_text(value) -> str | None:
     return value
   return json.dumps(value)
 
+def raise_for_bad_response(response):
+  if not response.ok:
+    try:
+        # Try to parse JSON error details
+        err_info = response.json()
+        err_msg = err_info.get('error') or err_info.get('message') or response.text
+    except Exception:
+        err_msg = response.text
+    raise HTTPError(f'{response.status_code}: {err_msg}')
+
 def synchronous_llm_request(creds: dict[str, str], model: str, payload: dict[str, str]):
   """Send a request to cloudflare workers AI and wait for complete reponse (only used for images)."""
   urlTemplate = 'https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{cf_model}'
@@ -250,9 +261,9 @@ def synchronous_llm_request(creds: dict[str, str], model: str, payload: dict[str
 
   try:
     response = requests.post(url, headers=hdrs, data=json.dumps(payload))
-    response.raise_for_status()
+    raise_for_bad_response(response)
   except Exception as err:
-    print('Request failed.\n', err)
+    print(f'{RED}Error: {err}{COL_END}')
     return ''
 
   result = response.json().get('result')
@@ -290,7 +301,7 @@ def streaming_llm_request(creds: dict[str, str], model: str, payload: dict, on_t
 
   try:
     with requests.post(url, headers=hdrs, data=json.dumps(payload), stream=True, timeout=(10, 300)) as response:
-      response.raise_for_status()
+      raise_for_bad_response(response)
       response.encoding = 'utf-8'
       for line in response.iter_lines(decode_unicode=True):
         # blank lines separate events, and ':' lines are keep-alive comments
@@ -356,7 +367,7 @@ def streaming_llm_request(creds: dict[str, str], model: str, payload: dict, on_t
             on_text(text)
 
   except Exception as err:
-    print(f'\n{RED}Request failed.\n{err}{COL_END}')
+    print(f'\n{RED}Error: {err}{COL_END}')
     return None
 
   if not complete:
