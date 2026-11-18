@@ -83,9 +83,10 @@ You can provide your own prompt for a more specific description:
 
 Commands can be entered at the chat prompt using the `/` prefix:
 
+* `/cd <dir>`: Change the working directory. No argument shows the current working directory. See [MCP servers](#mcp-servers).
 * `/clear`: Clear the conversation history and start a new conversation.
 * `/compact`: Compact the conversation history.
-* `/model`: Change the current model.
+* `/model <model>`: Change the current model. No argument shows current model.
 * `/exit` : Exit.
   
 ## Models
@@ -100,6 +101,16 @@ You can also specify which model to use on startup:
 
 ## MCP servers
 
-You can use MCP servers to give the model access to custom tools, enabling more agentic behaviour. Tool usage, such as file system search or web fetch, is supported by most models. To configure your choice of MCP servers and tools, create a `mcp.json` file in the same directory as the main script and add your MCP configuration. The JSON format closely matches Claude Desktop's MCP Server config. See the [example MCP config](./mcp.json.example).
+You can configure MCP servers to allow the model to use custom tools, such as file system access, web fetch and code editing. Tool usage is supported by most models.
 
+To configure your choice of MCP servers and tools, create a `mcp.json` file in the same directory as the main script and add your MCP configuration. The JSON format closely matches Claude Desktop's MCP Server config. See the [example MCP config](./mcp.json.example) to get started. 
 
+You will be asked for permission when a tool call is made. You can also choose to allow or deny all subsequent calls to the same tool.
+
+## File system access
+
+The working directory is used to restrict MCP tool access to your file system. It is initially the directory you launched from, and can be changed with the `/cd` command. 
+
+If a tool call has a path argument outside the working directory, you are always prompted, even for tool calls that you have allowed always. 
+
+In your MCP config, use the `${cwd}` placeholder in a MCP server's `args`, `cwd`, `env` or `url` parameters - it will be replaced with the working directory whenever a tool is called.

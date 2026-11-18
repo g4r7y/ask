@@ -2,16 +2,39 @@
   "mcpServers": {
     "filesystem": {
       "command": "npx",
-      "args": [ "-y", "@modelcontextprotocol/server-filesystem", "/mnt/sandbox" ]
-    },
-    "ripgrep": {
-      "command": "npx",
-      "args": ["-y", "mcp-ripgrep@latest" ],
-      "cwd": "/mnt/sandbox/my-project"
+      "args": [ "-y", "@modelcontextprotocol/server-filesystem", "${cwd}" ]
     },
     "web-fetch": {
       "command": "npx",
       "args": ["mcp-fetch-server"]
+    },
+    "git": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-git",
+        "--repository",
+        "${cwd}"
+      ]
+    },
+    "context7": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@upstash/context7-mcp"
+      ]
+    },
+     "serena": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/oraios/serena",
+        "serena",
+        "start-mcp-server",
+        "--context",
+        "ide-assistant",
+        "--project",
+        "${cwd}"
+      ]
     }
   }
 }

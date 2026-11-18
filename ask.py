@@ -15,7 +15,8 @@ from prompt_toolkit import PromptSession, ANSI
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.client.stdio import stdio_client, StdioServerParameters
-from mcp.types import Tool
+from mcp.types import Tool, Root, ListRootsResult
+from pathlib import Path
 from requests.models import HTTPError
 
 MODELS = {
@@ -37,6 +38,7 @@ AUTO_COMPACT_THRESHOLD = 25
 STOP_CHAR = '⏎'
 
 GREEN   = '\033[92m'
+YELLOW  = '\033[33m'
 CYAN    = '\033[36m'
 BR_CYAN = '\033[96m'
 RED     = '\033[31m'
@@ -51,8 +53,33 @@ mcp_server_config: dict = {}
 mcp_tools: list[tuple[str, Tool]] = []
 
 
+# the current working directory, changed with the /cd command. MCP tool calls are constrained to it.
+working_dir: str = os.path.realpath(os.getcwd())
+
+CWD_PLACEHOLDER = '${cwd}'
+
+def _resolve_mcp_config(config: dict) -> dict:
+  """Return a copy of a mcp server config with the ${cwd} placeholder replaced by the working directory."""
+  def sub(value):
+    return value.replace(CWD_PLACEHOLDER, working_dir) if isinstance(value, str) else value
+  resolved = dict(config)
+  for key in ('command', 'cwd', 'url'):
+    if key in resolved:
+      resolved[key] = sub(resolved[key])
+  if 'args' in resolved:
+    resolved['args'] = [sub(a) for a in resolved['args']]
+  if resolved.get('env'):
+    resolved['env'] = {k: sub(v) for k, v in resolved['env'].items()}
+  return resolved
+
+async def _list_mcp_roots(context) -> ListRootsResult:
+  """For MCP servers that understand roots, tell server that the working dir is the root."""
+  return ListRootsResult(roots=[Root(uri=Path(working_dir).as_uri(), name=os.path.basename(working_dir) or working_dir)])
+
+
 @asynccontextmanager
 async def _mcp_session(config: dict):
+  config = _resolve_mcp_config(config)
   # determine the type of transport from the server's config
   if config.get('command'):
     transport = 'stdio' 
@@ -66,13 +93,13 @@ async def _mcp_session(config: dict):
     params = StdioServerParameters(command=config['command'], args=config.get('args', []), env=config.get('env'), cwd=config.get('cwd'))
     with open(os.devnull, 'w') as devnull:
       async with stdio_client(params, errlog=devnull) as (read_stream, write_stream):
-        async with ClientSession(read_stream, write_stream) as session:
+        async with ClientSession(read_stream, write_stream, list_roots_callback=_list_mcp_roots) as session:
           await session.initialize()
           yield session
 
   elif transport == 'http':
     async with streamable_http_client(config['url']) as (read_stream, write_stream):
-      async with ClientSession(read_stream, write_stream) as session:
+      async with ClientSession(read_stream, write_stream, list_roots_callback=_list_mcp_roots) as session:
         await session.initialize()
         yield session
 
@@ -195,17 +222,51 @@ def get_tools() -> list[dict]:
 allowed_tools: set[str] = set()
 denied_tools: set[str] = set()
 
+PATH_ARG_KEYS = {
+  'path', 'paths', 'file', 'files', 'file_path', 'filepath', 'relative_path', 'directory', 'dir', 'folder',
+  'cwd', 'root', 'repo_path', 'repository', 'repo', 'source', 'destination', 'target', 'project', 'project_path',
+}
+
+def _is_within_working_dir(value: str) -> bool:
+  path = os.path.realpath(os.path.join(working_dir, os.path.expanduser(value)))
+  return os.path.commonpath([path, working_dir]) == working_dir
+
+def _paths_outside_working_dir(tool_args, key: str = '') -> list[str]:
+  """Find any tool arguments that look like paths and resolve outside the working dir."""
+  found = []
+  if isinstance(tool_args, dict):
+    # recursively check all items in dict
+    for k, v in tool_args.items():
+      found += _paths_outside_working_dir(v, str(k).lower())
+  elif isinstance(tool_args, list):
+    # recursively check all list items
+    for v in tool_args:
+      found += _paths_outside_working_dir(v, key)
+  elif isinstance(tool_args, str) and tool_args and '://' not in tool_args:
+    # got to a string, so check if it is an outside path
+    looks_like_path = key in PATH_ARG_KEYS or os.path.isabs(tool_args) or tool_args.startswith('~')
+    if looks_like_path and '\n' not in tool_args and not _is_within_working_dir(tool_args):
+      found.append(tool_args)
+  return found
+
 def approve_tool_call(tool_function: str, tool_args: dict) -> bool:
-  """Ask the user to approve a tool call, remembering 'always' answers for the session."""
+  """Ask the user to approve a tool call, remembering 'always' answers for the session.
+  Calls with paths outside the working directory are always prompted for, and can't be remembered."""
   if tool_function in denied_tools:
     return False
-  if tool_function in allowed_tools:
+  outside = _paths_outside_working_dir(tool_args)
+  if tool_function in allowed_tools and not outside:
     return True
   print(f"{CYAN}Tool call requested: {tool_function.replace('__', ' ')}{COL_END}")
   print(f"{DK_GREY}{json.dumps(tool_args, indent=2, ensure_ascii=False)}{COL_END}")
+  if outside:
+    print(f"{YELLOW}Warning: outside the working directory ({working_dir}): {', '.join(outside)}{COL_END}")
+    options = '[y]es / [n]o'
+  else:
+    options = '[y]es / [n]o / [a]llow always / [d]eny always'
   while True:
     try:
-      answer = input(f"{CYAN}Allow? [y]es / [n]o / [a]llow always / [d]eny always: {COL_END}").strip().lower()
+      answer = input(f"{CYAN}Allow? {options}: {COL_END}").strip().lower()
     except (EOFError, KeyboardInterrupt):
       print()
       return False
@@ -213,6 +274,8 @@ def approve_tool_call(tool_function: str, tool_args: dict) -> bool:
       return True
     if answer in ('n', 'no'):
       return False
+    if outside:
+      continue
     if answer in ('a', 'allow'):
       allowed_tools.add(tool_function)
       return True
@@ -646,6 +709,8 @@ class Chat:
     main_clause = "You are a helpful assistant called Bob. Please answer questions briefly and professionally, without asking follow up questions. Format all responses using markdown. Don't use markdown tables with more than 4 columns."
     stop_clause = f" You must finish each answer with a '{STOP_CHAR}' stop character."
     prompt = main_clause + (stop_clause if (MODELS[self.model]['schema'] == 'llama') else '')
+    if mcp_tools:
+      prompt += f" The current working directory is {working_dir}. You will be asked to confirm any tool calls that are outside the working directory."
     return {
       'role': 'system',
       'content': prompt
@@ -681,7 +746,7 @@ class Chat:
         )
         prompt = session.prompt()
         if (prompt[:1] == '/'):
-          self._dispatch_command(prompt[1:].lower())
+          self._dispatch_command(prompt[1:])
           ask_prompt = True
           continue
           
@@ -785,15 +850,32 @@ class Chat:
       print(f'{BR_CYAN}Available models:{COL_END}')
       for model in chat_models:
           print(f'{BR_CYAN}  {model}{COL_END}')
-    elif cmd_args[0] not in chat_models:
+    elif cmd_args[0].lower() not in chat_models:
       print(f'{BR_CYAN}Invalid model name.{COL_END}')
       print(f'{BR_CYAN}Available models: {", ".join(chat_models)}{COL_END}')
     else:
-      self.model = cmd_args[0]
+      self.model = cmd_args[0].lower()
       if len(self.conversation) > 0:
         # system message can be model dependent, so update it
         self.conversation[0] = self._system_message()
       print(f'{BR_CYAN}Model changed to: {self.model}{COL_END}')
+
+  def change_dir(self, cmd_args):
+    global working_dir
+    if len(cmd_args) == 0:
+      # no args, so just show the current directory
+      print(f'{BR_CYAN}Working directory: {working_dir}{COL_END}')
+      return
+    target = os.path.realpath(os.path.join(working_dir, os.path.expanduser(' '.join(cmd_args))))
+    if not os.path.isdir(target):
+      print(f'{BR_CYAN}Not a directory: {target}{COL_END}')
+      return
+    working_dir = target
+    os.chdir(working_dir)
+    if len(self.conversation) > 0:
+      # update the system message so it has the new working directory
+      self.conversation[0] = self._system_message()
+    print(f'{BR_CYAN}Working directory changed to: {working_dir}{COL_END}')
 
   def _quit(self):
     self.done = True
@@ -801,21 +883,22 @@ class Chat:
 
   def _dispatch_command(self, command: str):
     commands = {
+      'cd': self.change_dir,
       'clear': self.clear,
       'compact': self.compact,
       'model': self.set_model,
-      'exit': self._quit,
+      'quit': self._quit,
     }
 
     cmd_parts = command.split(' ')
-    handler = commands.get(cmd_parts[0])
+    handler = commands.get(cmd_parts[0].lower())
     if handler:
       if len(inspect.signature(handler).parameters) == 0:
         handler()
       else:
         handler(cmd_parts[1:])
     else:
-      print(f'{BR_CYAN}Available commands: {", ".join(commands.keys())}{COL_END}')
+      print(f'{BR_CYAN}Available commands: \n/{"\n/".join(commands.keys())}{COL_END}')
     print('')
       
 
@@ -860,7 +943,7 @@ try:
     chat = Chat(args.model)
     chat.start(prompt, args.quick)
 except (KeyboardInterrupt, EOFError):
-  print(RED + '\nExiting...' + COL_END + '\n')
+  print(YELLOW + '\nExiting...' + COL_END + '\n')
   sys.exit(0)
 
 
